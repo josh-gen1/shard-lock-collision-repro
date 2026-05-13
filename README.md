@@ -19,21 +19,34 @@ the second group hangs forever.
 
 ## What this repro does
 
-`repro.ts` uses the **published `@effect/cluster@0.58.2`** directly — it
-imports `SqlRunnerStorage`, `RunnerStorage`, `ShardingConfig`, etc. and wires
-up two real runners against one Postgres. No hand-rolled copy of the lock
-formula; the bug is reproduced by exercising the actual library code.
+`repro.ts` exercises the **published `@effect/cluster@0.58.2`** through the
+high-level pattern for segregating workloads across runners:
 
-Each "runner" gets its own `ManagedRuntime` with:
+- Each "pod" sets a disjoint `ShardingConfig.shardGroups` list.
+- An `Entity` is annotated with `ClusterSchema.ShardGroup` so its messages
+  route to a specific group based on the `entityId`.
+- `Entity.client` dispatches RPCs through `Sharding` to whichever runner owns
+  the target shard.
 
-- its own `PgClient` connection pool to the same Postgres,
-- its own `ShardingConfig` providing a distinct `shardGroups` list,
-- a `SqlRunnerStorage` built from those layers.
+The script stands up two `NodeClusterSocket.layer` runners in one process,
+on different ports, against the same Postgres:
 
-Both then call `storage.acquire(address, shardIds)` for their own group's
-shards. Because the buggy formula derives the lock number from the group's
-*index* in this runner's `shardGroups`, both runners ask Postgres for lock
-numbers `1_000_001..1_000_005` and the second one is shut out.
+| Runner | port  | `shardGroups` |
+| ------ | ----- | ------------- |
+| A      | 34431 | `["alpha"]`   |
+| B      | 34432 | `["bravo"]`   |
+
+Both register the same `Counter` entity, which routes `bravo:*` entityIds to
+group `"bravo"` and everything else to `"alpha"`. From Runner A, the script
+sends a `Ping` RPC to `alpha:hello` and to `bravo:hello`, each with a
+5-second timeout.
+
+If the documented pattern worked, both pings would return. On
+`@effect/cluster@0.58.2`, the `bravo` ping times out: Runner B is locked
+out of all its shards by the advisory-lock collision in `SqlRunnerStorage`
+(both runners ask Postgres for lock numbers `1_000_001..1_000_005`, so the
+second one is shut out), so no runner is processing messages for the
+`bravo` group.
 
 ## Run it
 
@@ -55,16 +68,16 @@ docker rm -f shard-lock-repro
 Expected output:
 
 ```
-=== Two runners, disjoint shardGroups (published @effect/cluster@0.58.2) ===
-  [Runner A] shardGroups=["alpha"] → acquired 5/5
-  [Runner B] shardGroups=["bravo"] → acquired 0/5, LOST 5: bravo:1, ...
-  result: A=5 shards, B=0 shards  ❌ orphaned groups: bravo
+=== Two cluster runners, disjoint shardGroups (published @effect/cluster@0.58.2) ===
+
+From Runner A, pinging entities in each group:
+  ✅ alpha:hello → pong: alpha:hello
+  ❌ bravo:hello → TIMED OUT (worker not processing)
 ```
 
-The lock numbers themselves don't overlap from each runner's local
-perspective (each one asks for "its" range starting at index 0) — but the
-*global* lock numbers they request are identical, so the second runner can
-never acquire any of them.
+> Note: if you re-run against a Postgres that already has the `cluster_*`
+> tables from a previous run, drop them first
+> (`DROP TABLE IF EXISTS cluster_runners, cluster_locks, cluster_messages, cluster_replies CASCADE`).
 
 ## Proposed fix
 
